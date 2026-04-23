@@ -24,8 +24,10 @@ class OrientedGraphNode:
             ):
         if id:
             self.id = id
+            if id >= self.__class__.id_counter:
+                self.__class__.id_counter = id + 1
         else:
-            self.id = self.id_counter
+            self.id = self.__class__.id_counter
             self.__class__.id_counter += 1
 
         parents = parents if parents else []
@@ -47,6 +49,10 @@ class OrientedGraphNode:
         for child in children:
             child.parents.add(self)
     
+    def clear_refs(self):
+        self.parents = None
+        self.children = None
+
     def copy(self, *args, **kwargs):
         return self.__class__(*args, parents=None, children=None, id=self.id, **kwargs)
 

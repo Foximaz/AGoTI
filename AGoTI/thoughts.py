@@ -1,4 +1,4 @@
-from typing import Iterable, List, Dict, Optional
+from typing import Iterable, List, Dict, Optional, Any
 from .utils import OrientedGraphNode, Message
 
 class Thought(OrientedGraphNode):
@@ -10,7 +10,7 @@ class Thought(OrientedGraphNode):
         text (str):              Generated thought
         parents (List[Thought]): Parent Thoughts
         prompt (List[Message]):  Prompt used to generate Thought
-        tags (Dict[str, any]):   Custom tags
+        tags (Dict[str, Any]):   Custom tags
     """
 
     id_counter: int = 0
@@ -20,9 +20,10 @@ class Thought(OrientedGraphNode):
             text: str,
             parents: Optional[Iterable]=None,
             prompt: Optional[List[Message]]="",
-            tags: Optional[Dict[str, any]]=None
+            tags: Optional[Dict[str, Any]]=None,
+            id: Optional[int]=None
             ):
-        super().__init__(parents, None) # GoT is acyclic
+        super().__init__(parents, None, id) # GoT is acyclic
         self.text = text
         self.prompt = prompt
         self.tags = tags if tags else {}

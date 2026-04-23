@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict, Tuple, Iterable, AsyncIterator
+from typing import Optional, List, Dict, Tuple, Iterable, AsyncIterator, Any
 from enum import Enum
 from abc import ABC, abstractmethod
 import logging
@@ -22,7 +22,8 @@ class Operation(ABC, OrientedGraphNode):
 
     Attributes:
         id (int):                   Unique operation identifier
-        parents (List[Operation]):  List of parent operations
+        parents (set[Operation]):   Set of parent operations
+        children (set[Operation]):  Set of child operations
         status (Status):            Status of operation in execution
         name (str):                 Name of operation
         description (str):          Description of operation
@@ -44,12 +45,13 @@ class Operation(ABC, OrientedGraphNode):
             status: Status=Status.IDLE,
             name: Optional[str]=None,
             description: str="",
-            tags: Optional[Dict[str, any]]=None
+            tags: Optional[Dict[str, Any]]=None,
+            id: Optional[int]=None
             ):
         self.finished = OneTimeEvent()
         self.subscribers: List[PeekableQueue] = []
         self.subscribtions: Dict[Operation, PeekableQueue] = {}
-        super().__init__(parents, children)
+        super().__init__(parents, children, id)
         self.status = status
         self._init_status = status
         self.name = name if name else self.DEFAULT_NAME + f" {self.id}"
@@ -79,12 +81,12 @@ class Operation(ABC, OrientedGraphNode):
         return True
 
     @abstractmethod
-    async def operation(self) -> None:
+    async def operation(self, **kwargs) -> None:
         pass
 
     async def run(self, **kwargs) -> None:
         if (not await self.check_condition()):
-            logger.info(f"[{self.name}] start condition has not been met")
+            logger.debug(f"[{self.name}] start condition has not been met")
             self.status = Status.IDLE
             for queue in self.subscribtions.values():
                 queue.clear()
@@ -95,9 +97,9 @@ class Operation(ABC, OrientedGraphNode):
                 child.status = Status.RUNNING
                 tasks.append(asyncio.create_task(child.run(**kwargs)))
         
-        logger.info(f"[{self.name}] started")
-        await self.operation()
-        logger.info(f"[{self.name}] finished with {len(self.thoughts)} thoughts generated")
+        logger.debug(f"[{self.name}] started")
+        await self.operation(**kwargs)
+        logger.debug(f"[{self.name}] finished with {len(self.thoughts)} thoughts generated")
 
         for subscriber in self.subscribers:
             #TODO: process query waiting
@@ -107,12 +109,12 @@ class Operation(ABC, OrientedGraphNode):
         self.finished.set()
         #TODO: process exceptions
         #TODO: perhaps, return tasks instead, and await them on the top level?
-        logger.info(f"[{self.name}] awaiting {len(tasks)} other operations to finish")
+        logger.debug(f"[{self.name}] awaiting {len(tasks)} other operations to finish")
         if tasks:
             await asyncio.gather(*tasks) # , return_exceptions=True
-        logger.info(f"[{self.name}] exiting")
+        logger.debug(f"[{self.name}] exiting")
     
-    def clear(self, propogate=True):
+    def reset(self, propogate=True):
         self.thoughts: List[Thought] = []
         for queue in self.subscribers:
             queue.clear()
@@ -120,11 +122,19 @@ class Operation(ABC, OrientedGraphNode):
 
         if propogate:
             for child in self.children:
-                child.clear()
+                child.reset()
 
-    #TODO: correct copy for specific operations
+    def clear_refs(self):
+        super().clear_refs()
+        self.subscribers = None
+        self.subscribtions = None
+        self.finished = None
+        for thought in self.thoughts:
+            thought.clear_refs()
+        self.thoughts = None
+
     def copy(self, *args, **kwargs):
-        op_copy = super().copy(
+        return super().copy(
             *args,
             status=self.status,
             name=self.name,
@@ -132,7 +142,6 @@ class Operation(ABC, OrientedGraphNode):
             tags=self.tags.copy(),
             **kwargs
         )
-        return op_copy
 
 
 class BasicOperation(Operation):
@@ -146,11 +155,11 @@ class BasicOperation(Operation):
     async def operation_task(self, thoughts: Iterable[Thought], **kwargs) -> List[Thought]:
         pass
 
-    async def operation(self):
+    async def operation(self, **kwargs):
         thought_collector = self.thought_collector()
         tasks = []
-        async for thoughts, kwargs in thought_collector:
-            task = asyncio.create_task(self.operation_task(thoughts, **kwargs))
+        async for thoughts, t_kwargs in thought_collector:
+            task = asyncio.create_task(self.operation_task(thoughts, **t_kwargs, **kwargs))
             task.add_done_callback(self._handle_thoughts)
             tasks.append(task)
         await asyncio.gather(*tasks)
@@ -158,11 +167,12 @@ class BasicOperation(Operation):
     def _handle_thoughts(self, task):
         try:
             thoughts = task.result()
-            self.thoughts += thoughts
             for thought in thoughts:
-                for subscriber in self.subscribers:
-                    #TODO: process query waiting
-                    subscriber.put_nowait(thought)
+                self.thoughts.append(thought)
+                if not thought.tags.get("no_send", False):
+                    for subscriber in self.subscribers:
+                        #TODO: process query waiting
+                        subscriber.put_nowait(thought)
         except Exception as e:
             logger.error(f"[{self.name}] Error while processing operation_task result in _handle_thoughts: {e}")
 
@@ -181,29 +191,43 @@ class Generator(BasicOperation):
             )
         self.model = model
         self.generation_config = generation_config
-    
+
     @abstractmethod
     async def make_prompt(self, **kwargs) -> List[Message]:
         pass
 
     # default parser
-    def parse_generation(self, text: str) -> List[str]:
-        return [text]
+    def parse_generation(self, text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        return [{}], [text]
 
-    async def operation_task(self, parents, **kwargs):
+    async def operation_task(self, parents, replace: Optional[Dict[str, str]]=None, **kwargs):
         messages = self.make_prompt(**kwargs)
+        
+        if replace:
+            for src, dst in replace.items():
+                for message in messages:
+                    message["content"] = message["content"].replace(src, dst)
+
         response = await self.model.generate(messages, self.generation_config)
         if response is None:
-            logger.error(f"[{self.name}] generation unsuccesfull!")
-            return
-        logger.info(f"[{self.name}] generation succesfull (generated strlen: {len(response)})")
-        responses = self.parse_generation(response)
-        thoughts = []
-        for response in responses:
-            thought = Thought(response, parents=parents, prompt=messages)
+            logger.error(f"[{self.name}] generation unsuccesfull! Messages:\n{messages}")
+            return []
+        logger.debug(f"[{self.name}] generation succesfull (generated strlen: {len(response)})")
+        original_thought = Thought(response, parents=parents, prompt=messages, tags={"no_send": True, "parsed": False})
+        thoughts = [original_thought]
+        all_tags, responses = self.parse_generation(response)
+        for tags, response in zip(all_tags, responses):
+            thought = Thought(response, parents=[original_thought], prompt=messages, tags=tags  | {"parsed": True})
             thoughts.append(thought)
         return thoughts
-
+    
+    def copy(self, *args, **kwargs):
+        return super().copy(
+            *args,
+            model=self.model,
+            generation_config=self.generation_config,
+            **kwargs
+        )
 
 async def parents_finished(parents: List[Operation]) -> bool:
     for parent in parents:
@@ -254,13 +278,13 @@ class SimplePromptGenerator(Generator):
 
     def make_prompt(self, **kwargs):
         return self.messages
-    
-    async def run(self, **kwargs):
-        replace = kwargs.get("replace", {})
-        for src, dst in replace.items():
-            for message in self.messages:
-                message["content"] = message["content"].replace(src, dst)
-        await super().run(**kwargs)
+        
+    def copy(self, *args, **kwargs):
+        return super().copy(
+            *args,
+            messages=self.messages,
+            **kwargs
+        )
 
 
 #TODO: error processing
@@ -336,8 +360,8 @@ class SimpleForwardGenerator(Generator):
             yield ([thought], {"text": thought.text})
 
 
-class SimpleAggrigator(Generator):
-    DEFAULT_NAME = "SimpleAggrigator"
+class SimpleAggregator(Generator):
+    DEFAULT_NAME = "SimpleAggregator"
 
     async def check_condition(self):
         return await parents_finished(self.parents)
@@ -372,6 +396,13 @@ class Tagger(BasicOperation):
             thought = Thought(thought.text, parents=parents + [thought], tags=thought.tags.copy())
         thought.tags.update(tags)
         return [thought]
+    
+    def copy(self, *args, **kwargs):
+        return super().copy(
+            *args,
+            do_copy_thought=self.do_copy_thought,
+            **kwargs
+        )
 
 
 class SimpleIterationCounter(Tagger):
@@ -400,6 +431,14 @@ class SimpleIterationCounter(Tagger):
     async def get_tags(self, prev) -> Dict[str, any]:
         return {"iteration": prev + 1}
 
+    def copy(self, *args, **kwargs):
+        return super().copy(
+            *args,
+            tag_name=self.tag_name,
+            **kwargs
+        )
+
+
 class TagGenerator(Tagger):
     def __init__(
             self,
@@ -425,8 +464,16 @@ class TagGenerator(Tagger):
         if response is None:
             logger.error(f"[{self.name}] generation unsuccesfull!")
             return {}
-        logger.info(f"[{self.name}] generation succesfull (generated strlen: {len(response)})")
+        logger.debug(f"[{self.name}] generation succesfull (generated strlen: {len(response)})")
         return self.parse_generation(response)
+
+    def copy(self, *args, **kwargs):
+        return super().copy(
+            *args,
+            model=self.model,
+            generation_config=self.generation_config
+            **kwargs
+        )
 
 
 class SimpleScoreGenerator(TagGenerator):
@@ -449,8 +496,16 @@ class SimpleScoreGenerator(TagGenerator):
         else:
             logger.error(f"[{self.name}] Error while parsing generation of score")
             return {self.tag_name: 0.0}
+    
+    def copy(self, *args, **kwargs):
+        return super().copy(
+            *args,
+            tag_name=self.tag_name,
+            **kwargs
+        )
 
 
+#TODO: maybe try different approach?..
 class ChoiceDummyOperation(BasicOperation):
     DEFAULT_NAME = "ChoiceDummyOperation"
 
@@ -464,6 +519,8 @@ class ChoiceDummyOperation(BasicOperation):
 
     async def operation_task(self, thoughts: Iterable[Thought], **kwargs):
         return thoughts
+
+    #TODO: copy
 
 
 class SimpleRouter(BasicOperation):
@@ -537,16 +594,16 @@ class NBestFilter(SimpleRouter):
 
     async def route(self, score: float, threshold: float):
         if self.count >= self.n_best:
-            logger.info(f"[{self.name}] route - False (over limit)")
+            logger.debug(f"[{self.name}] route - False (over limit)")
             return "False"
         if score >= threshold:
             self.count += 1
-            logger.info(f"[{self.name}] route - True (high score: {score})")
+            logger.debug(f"[{self.name}] route - True (high score: {score})")
             return "True"
-        logger.info(f"[{self.name}] route - False (low score: {score})")
+        logger.debug(f"[{self.name}] route - False (low score: {score})")
         return "False"
     
-    def clear(self, propogate=True):
+    def reset(self, propogate=True):
         self.count = 0
         super().clear(propogate)
 
@@ -572,5 +629,5 @@ class IterationFilter(SimpleRouter):
                 yield ([parent], {"iteration": parent.tags[self.tag_name]})
     
     async def route(self, iteration):
-        logger.info(f"[{self.name}] iteration {iteration}")
+        logger.debug(f"[{self.name}] iteration {iteration}")
         return "Less" if iteration < self.threshold else "GreaterOrEqual"
