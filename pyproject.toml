@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "AGoTI"
+version = "0.1.0"
+description = "Asynchronous Graphs of Thoughts Interface"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "openai>=1.0.0",
+]
+
+
+[project.optional-dependencies]
+render = [
+    "graphviz>=0.20",
+]
